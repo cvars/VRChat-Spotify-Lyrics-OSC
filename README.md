@@ -1,5 +1,8 @@
 # Spotify Lyrics Grabber (SLG)
 
+## Showcase
+[![Watch the demo](https://img.youtube.com/vi/s9rCFJvm7QI/0.jpg)](https://www.youtube.com/watch?v=s9rCFJvm7QI)
+
 ## Overview
 Spotify Lyrics Grabber (SLG) is a tool designed to enhance your Spotify experience by synchronizing lyrics with the music you're playing. It consists of two main components:
 
