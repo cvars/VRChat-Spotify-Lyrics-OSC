@@ -1,137 +1,100 @@
-// Set an interval to fetch and send lyrics every (500 milliseconds)
-const FETCH_INTERVAL_MS = 500; // 500 milliseconds
-
-// Variables to track the last fetched lyrics and currently playing track
-let lastFetchedLyrics = '';
-let lastFetchedTrack = '';
-
+// background.js
+const FETCH_INTERVAL_MS = 100;
+let lastLyrics = '';
+let lastTrack = '';
 let fetchInterval;
 
-chrome.runtime.onInstalled.addListener(() => {
-    console.log('Spotify Lyrics Grabber installed.');
-    startFetchingLyrics();
-});
+chrome.runtime.onInstalled.addListener(startFetching);
+chrome.runtime.onStartup.addListener(startFetching);
 
-chrome.runtime.onStartup.addListener(() => {
-    startFetchingLyrics();
-});
-
-function startFetchingLyrics() {
-    if (fetchInterval) {
-        clearInterval(fetchInterval);
-    }
-    fetchInterval = setInterval(fetchAndSendLyrics, FETCH_INTERVAL_MS);
+function startFetching() {
+    if (fetchInterval) clearInterval(fetchInterval);
+    fetchInterval = setInterval(fetchAndSend, FETCH_INTERVAL_MS);
 }
 
-function fetchAndSendLyrics() {
-    chrome.tabs.query({ active: true, currentWindow: true }, function(tabs) {
-        if (tabs.length === 0) return; // No active tab found
+function fetchAndSend() {
+    chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
+        if (!tabs.length) return;
+        const tabId = tabs[0].id;
 
-        chrome.scripting.executeScript({
-            target: { tabId: tabs[0].id },
-            func: getSpotifyLyrics
-        }, (results) => {
-            if (!results || results.length === 0) {
-                console.log('No results returned from executeScript.');
-                return;
-            }
-
-            const currentLyrics = results[0]?.result; // Use optional chaining to avoid errors
-            if (currentLyrics && currentLyrics !== lastFetchedLyrics) {
-                console.log('Fetched lyrics:', currentLyrics);
-                // Save lyrics using local storage
-                chrome.storage.local.set({ 'lyrics': currentLyrics }, () => {
-                    console.log('Lyrics saved.');
-                });
-                // Send lyrics to Node.js server
-                sendLyricsToServer(currentLyrics);
-                // Update last fetched lyrics
-                lastFetchedLyrics = currentLyrics;
-            } else {
-                console.log('Lyrics unchanged or not found!');
+        chrome.scripting.executeScript({ target: { tabId }, func: scrapeLyrics }, res => {
+            const lyrics = res?.[0]?.result;
+            if (lyrics && lyrics !== lastLyrics) {
+                lastLyrics = lyrics;
+                chrome.storage.local.set({ lyrics });
+                send('lyrics', lyrics);
             }
         });
 
-        chrome.scripting.executeScript({
-            target: { tabId: tabs[0].id },
-            func: getCurrentlyPlaying
-        }, (results) => {
-            if (!results || results.length === 0) {
-                console.log('No results returned from executeScript.');
-                return;
-            }
-
-            const currentTrack = results[0]?.result; // Use optional chaining to avoid errors
-            if (currentTrack && currentTrack !== lastFetchedTrack) {
-                console.log('Fetched track:', currentTrack);
-                // Save track info using local storage
-                chrome.storage.local.set({ 'currentTrack': currentTrack }, () => {
-                    console.log('Track info saved.');
-                });
-                // Send track info to Node.js server
-                sendTrackToServer(currentTrack);
-                // Update last fetched track
-                lastFetchedTrack = currentTrack;
-            } else {
-                console.log('Track info unchanged or not found!');
+        chrome.scripting.executeScript({ target: { tabId }, func: scrapeTrack }, res => {
+            const track = res?.[0]?.result;
+            if (track && track !== lastTrack) {
+                lastTrack = track;
+                chrome.storage.local.set({ track });
+                send('track', track);
             }
         });
     });
 }
 
-function getSpotifyLyrics() {
-    const lyricsContainer = document.querySelector('._Wna90no0o0dta47Heiw');
-    if (lyricsContainer) {
-        const visibleLyricDiv = lyricsContainer.querySelector('div[data-testid="fullscreen-lyric"].EhKgYshvOwpSrTv399Mw > div');
-        if (visibleLyricDiv) {
-            return visibleLyricDiv.innerText.trim();
-        } else {
-            return ''; //No visible lyrics found!
-        }
-    } else {
-        return ''; //Lyrics container not found
+// ✅ fixed: gets all lyric lines, skips empty or ♪
+function scrapeAllLyrics() {
+    const nodes = document.querySelectorAll('div[data-testid="fullscreen-lyric"] div.MmIREVIj8A2aFVvBZ2Ev');
+    return Array.from(nodes)
+        .map(n => n.innerText.trim())
+        .filter(line => line && line !== '♪')
+        .join('\n');
+}
+
+function scrapeLyrics() {
+    // all lyric containers
+    const containers = Array.from(document.querySelectorAll('div[data-testid="fullscreen-lyric"]'));
+
+    if (!containers.length) return '';
+
+    // 1) Prefer container that has a class token starting with '_'
+    const byUnderscoreClass = containers.find(c =>
+        Array.from(c.classList).some(tok => tok.startsWith('_'))
+    );
+    if (byUnderscoreClass) {
+        const inner = byUnderscoreClass.querySelector('div.MmIREVIj8A2aFVvBZ2Ev');
+        if (inner) return inner.innerText.trim();
     }
-}
 
-function getCurrentlyPlaying() {
-    const nowPlayingContainer = document.querySelector('div[data-testid="now-playing-widget"]');
-    if (nowPlayingContainer) {
-        const trackTitleElement = nowPlayingContainer.querySelector('div[data-testid="context-item-info-title"] a');
-        const artistNameElement = nowPlayingContainer.querySelector('div[data-testid="context-item-info-subtitles"] a');
-        if (trackTitleElement && artistNameElement) {
-            const trackTitle = trackTitleElement.innerText.trim();
-            const artistName = artistNameElement.innerText.trim();
-            return `${trackTitle} by ${artistName}`;
-        } else {
-            return ''; //Now playing information not found!
-        }
-    } else {
-        return ''; //Now playing container not found!
+    // 2) Newer Spotify builds may mark the active line explicitly
+    const explicit = document.querySelector('div[data-testid="fullscreen-lyric"] div[data-testid="fullscreen-lyric-line-current"]');
+    if (explicit) return explicit.innerText.trim();
+
+    // 3) Heuristic: pick the lyric line that looks "active" by computed style
+    for (const c of containers) {
+        const inner = c.querySelector('div.MmIREVIj8A2aFVvBZ2Ev');
+        if (!inner) continue;
+        const cs = window.getComputedStyle(inner);
+        // active line often has stronger font-weight or higher opacity
+        const weight = parseInt(cs.fontWeight) || 400;
+        const opacity = parseFloat(cs.opacity || '1');
+        if (weight >= 600 || opacity > 0.95) return inner.innerText.trim();
     }
+
+    // 4) fallback: return first non-empty lyric line
+    for (const c of containers) {
+        const inner = c.querySelector('div.MmIREVIj8A2aFVvBZ2Ev');
+        if (inner && inner.innerText.trim()) return inner.innerText.trim();
+    }
+
+    return '';
 }
 
-function sendLyricsToServer(lyrics) {
-    fetch('http://localhost:3000?lyrics=' + encodeURIComponent(lyrics), {
-        method: 'GET'
-    })
-    .then(response => response.text())
-    .then(data => {
-        console.log('Server response:', data);
-    })
-    .catch(error => {
-        console.error('Error:', error);
-    });
+
+function scrapeTrack() {
+    const title = document.querySelector('div[data-testid="context-item-info-title"] a');
+    const artist = document.querySelector('div[data-testid="context-item-info-subtitles"] a');
+    return (title && artist) ? `${title.innerText.trim()} by ${artist.innerText.trim()}` : '';
 }
 
-function sendTrackToServer(track) {
-    fetch('http://localhost:3000?track=' + encodeURIComponent(track), {
-        method: 'GET'
-    })
-    .then(response => response.text())
-    .then(data => {
-        console.log('Server response:', data);
-    })
-    .catch(error => {
-        console.error('Error:', error);
-    });
+function send(type, value) {
+    fetch(`http://localhost:3000?${type}=` + encodeURIComponent(value))
+        .then(r => r.text())
+        .then(console.log)
+        .catch(console.error);
 }
